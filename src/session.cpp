@@ -182,18 +182,23 @@ void Session::handleBinaryFrame(const BinaryFrame& frame) {
             size_t sep = topic.find('\0');
             
             if (sep != std::string::npos) {
-                // New format with client ID
+                // Legacy format: "client_id\0topic" embedded in the topic field
                 client_id_ = topic.substr(0, sep);
                 topic = topic.substr(sep + 1);
-                
-                // Register client with broker
+
                 broker_->registerClient(client_id_, this);
-                
-                // Use smart replay for this client
-                broker_->subscribe(this, topic);
                 broker_->replayMessagesForClient(this, topic, client_id_);
+                broker_->subscribe(this, topic);
+            } else if (!frame.payload.empty()) {
+                // New format (MetricMQ library): client_id is in the payload field,
+                // actual topic is in the topic field.
+                client_id_ = frame.payload;
+
+                broker_->registerClient(client_id_, this);
+                broker_->replayMessagesForClient(this, topic, client_id_);
+                broker_->subscribe(this, topic);
             } else {
-                // Legacy format without client ID (replay all)
+                // No client_id present — plain subscribe, no replay.
                 broker_->subscribe(this, topic);
             }
             
@@ -383,14 +388,8 @@ void Session::handleCommand(const RespValue& command) {
         std::string topic = arr[1].asString();
         std::string payload = arr[2].asString();
         
-        // Create message array: ["message", topic, payload]
-        RespArray msg;
-        msg.push_back(RespValue::bulkString("message"));
-        msg.push_back(RespValue::bulkString(topic));
-        msg.push_back(RespValue::bulkString(payload));
-        std::string serialized = RespParser::serialize(RespValue::array(msg));
-        
-        broker_->publish(topic, serialized);
+        // Store and route raw payload; deliverMessage() handles per-protocol wrapping
+        broker_->publish(topic, payload);
         
         // Reply with number of subscribers (simplified: always return 1)
         sendResp(RespValue::integer(1));
@@ -428,6 +427,9 @@ void Session::sendResp(const RespValue& value) {
 
 void Session::send(const std::string& data) {
     if (sock_fd_ == -1) return;
+    // Mutex ensures that replay and live-delivery threads cannot interleave
+    // bytes from different frames on the same socket.
+    std::lock_guard<std::mutex> lock(send_mutex_);
     // Loop until all bytes are sent. ::send() on a loaded kernel buffer may
     // return fewer bytes than requested; silently dropping the remainder would
     // produce truncated frames on the receiver.

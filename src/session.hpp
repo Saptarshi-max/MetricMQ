@@ -22,6 +22,7 @@
 #pragma once
 #include <string>
 #include <chrono>
+#include <mutex>
 
 namespace metricmq {
 
@@ -82,6 +83,11 @@ public:
      */
     void setClientId(const std::string& client_id) { client_id_ = client_id; }
 
+    /** @brief Return the detected protocol type for this session. */
+    ProtocolType getProtocol() const { return protocol_type_; }
+
+    friend class Broker;  ///< Allow Broker to call private send methods
+
 private:
     void handleCommand(const RespValue& command);     ///< Dispatch RESP command to broker.
     void handleBinaryFrame(const BinaryFrame& frame); ///< Dispatch binary frame to broker.
@@ -95,6 +101,7 @@ private:
     ProtocolType protocol_type_;  ///< Protocol detected for this connection.
     uint64_t     sequence_;       ///< Local sequence counter.
     std::string  client_id_;      ///< Client ID for exactly-once delivery tracking.
+    mutable std::mutex send_mutex_;  ///< Serialises concurrent sendBinary/send calls.
 
     /// Timestamp of the last byte received on this connection.
     /// Reset on every successful recv(). When now() - last_activity_ exceeds

@@ -16,6 +16,8 @@
 
 #include "broker.hpp"
 #include "session.hpp"
+#include "binary_protocol.hpp"
+#include "resp_parser.hpp"
 #include "metricmq/logger.hpp"
 #include "metricmq/metrics.hpp"
 #include <iostream>
@@ -66,8 +68,10 @@ void Broker::subscribe(Session* session, const std::string& topic) {
         Metrics::instance().setTopicCount(topic_subscribers_.size());
     }
     
-    // Replay persisted messages to new subscriber (outside lock)
-    replayMessages(session, topic, 0);
+    // No replay here for binary clients — session.cpp already calls
+    // replayMessagesForClient() before subscribe() so replay is complete
+    // before live messages can arrive.
+    // RESP clients have no stable client_id so replay is not applicable.
 }
 
 void Broker::unsubscribe(Session* session, const std::string& topic) {
@@ -114,7 +118,8 @@ uint64_t Broker::publish(const std::string& topic, const std::string& payload) {
     auto it = topic_subscribers_.find(topic);
     if (it != topic_subscribers_.end()) {
         for (auto* session : it->second) {
-            session->send(payload);
+            // Send in the format appropriate for this session's protocol
+            deliverMessage(session, topic, payload, seq);
         }
         delivered += it->second.size();
     }
@@ -123,7 +128,8 @@ uint64_t Broker::publish(const std::string& topic, const std::string& payload) {
     auto wildcard_it = topic_subscribers_.find("#");
     if (wildcard_it != topic_subscribers_.end()) {
         for (auto* session : wildcard_it->second) {
-            session->send(payload);
+            // Send in the format appropriate for this session's protocol
+            deliverMessage(session, topic, payload, seq);
         }
         delivered += wildcard_it->second.size();
     }
@@ -150,7 +156,7 @@ void Broker::replayMessages(Session* session, const std::string& topic, uint64_t
         auto messages = persistence_->load_range(from_seq, from_seq + MAX_STORED_MESSAGES);
         for (const auto& [seq, msg_topic, msg_payload] : messages) {
             if (msg_topic == topic) {
-                session->send(msg_payload);
+                deliverMessage(session, msg_topic, msg_payload, seq);
             }
         }
     }
@@ -159,11 +165,15 @@ void Broker::replayMessages(Session* session, const std::string& topic, uint64_t
 void Broker::removeSession(Session* session) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // Remove from all topic subscriptions
+    // Remove from all topic subscriptions and update per-topic metrics.
+    // unsubscribe() only fires on an explicit UNSUBSCRIBE frame; abrupt
+    // disconnects come straight here, so we must decrement the gauge ourselves.
     for (auto& [topic, subscribers] : topic_subscribers_) {
-        subscribers.erase(session);
+        if (subscribers.erase(session)) {
+            Metrics::instance().decrementTopicSubscribers(topic);
+        }
     }
-    
+
     // Remove empty topics
     for (auto it = topic_subscribers_.begin(); it != topic_subscribers_.end();) {
         if (it->second.empty()) {
@@ -403,9 +413,26 @@ void Broker::registerClient(const std::string& client_id, Session* session) {
         for (uint64_t seq : acks) {
             bounded.insert(seq);
         }
-        if (!bounded.empty()) {
-            last_ack_seq_[client_id] = bounded.max_seq();
-        }
+    }
+}
+
+void Broker::deliverMessage(Session* session, const std::string& topic, 
+                           const std::string& payload, uint64_t sequence) {
+    // Send message in the format appropriate for this session's protocol
+    ProtocolType protocol = session->getProtocol();
+    
+    if (protocol == ProtocolType::BINARY) {
+        // For binary clients, send as a binary message frame
+        BinaryFrame msg = BinaryFrame::message(topic, payload, sequence);
+        session->sendBinary(msg);
+    } else {
+        // RESP clients expect: ["message", topic, payload]
+        RespArray msg;
+        msg.push_back(RespValue::bulkString("message"));
+        msg.push_back(RespValue::bulkString(topic));
+        msg.push_back(RespValue::bulkString(payload));
+        std::string serialized = RespParser::serialize(RespValue::array(msg));
+        session->send(serialized);
     }
 }
 
@@ -425,7 +452,7 @@ void Broker::replayMessagesForClient(Session* session, const std::string& topic,
         auto messages = persistence_->load_range(last_ack + 1, last_ack + MAX_STORED_MESSAGES);
         for (const auto& [seq, msg_topic, msg_payload] : messages) {
             if (msg_topic == topic && !isAcked(client_id, seq)) {
-                session->send(msg_payload);
+                deliverMessage(session, msg_topic, msg_payload, seq);
             }
         }
     }

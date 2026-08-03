@@ -84,6 +84,10 @@ public:
 private:
     int countTotalSubscribers() const;  // Helper for metrics
     void runCompactionIfDue();          // Periodic LMDB compaction
+    
+    // Protocol-aware message delivery
+    void deliverMessage(Session* session, const std::string& topic, 
+                       const std::string& payload, uint64_t sequence);
 
     int port_;
     int server_fd_;
